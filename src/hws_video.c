@@ -92,6 +92,7 @@ static const v4l2_model_timing_t support_videofmt[]= {
     [V4L2_MODEL_VIDEOFORMAT_720X480P60]		= V4L2_MODEL_TIMING(720,480,60,0),
     [V4L2_MODEL_VIDEOFORMAT_720X576P50]		= V4L2_MODEL_TIMING(720,480,50,0),
     [V4L2_MODEL_VIDEOFORMAT_800X600P60]		= V4L2_MODEL_TIMING(800,600,60,0),
+	[V4L2_MODEL_VIDEOFORMAT_640X480P60]		= V4L2_MODEL_TIMING(640,480,60,0),
     [V4L2_MODEL_VIDEOFORMAT_1024X768P60]	= V4L2_MODEL_TIMING(1024,768,60,0),
     [V4L2_MODEL_VIDEOFORMAT_1280X768P60]	= V4L2_MODEL_TIMING(1280,768,60,0),
     [V4L2_MODEL_VIDEOFORMAT_1280X800P60]	= V4L2_MODEL_TIMING(1280,800,60,0),
@@ -283,7 +284,7 @@ static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capabi
 	//printk( "%s\n", __func__);
 	strcpy(cap->driver, KBUILD_MODNAME);
 	sprintf(cap->card, "%s %d",HWS_VIDEO_NAME,vi_index);
-	strcpy(cap->bus_info, "HWS");
+	sprintf(cap->bus_info, "HWS-%s-%d",HWS_VIDEO_NAME,vi_index);
 	cap->device_caps =	V4L2_CAP_VIDEO_CAPTURE |V4L2_CAP_STREAMING;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	//printk( "%s(IN END  )\n", __func__);
@@ -319,7 +320,7 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 		    //printk("%s..pixfmt=%d.\n",__func__,f->index);
 		    f->index = index;
 		    f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		    strlcpy(f->description, pixfmt->name, sizeof(f->description));
+		    memcpy(f->description, pixfmt->name, strlen(pixfmt->name));
 		    f->pixelformat=pixfmt->fourcc;
 		}
 	}
@@ -3249,7 +3250,7 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q->io_modes = VB2_READ | VB2_MMAP | VB2_USERPTR;
 		//q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_DMABUF | VB2_READ;
 		q->gfp_flags = GFP_DMA32;
-		q->min_buffers_needed = 2;
+		//q->min_buffers_needed = 2;
 		q->drv_priv = &(dev->video[i]);
 		q->buf_struct_size = sizeof(struct hwsvideo_buffer);
 		q->ops = &hwspcie_video_qops;
@@ -4794,6 +4795,12 @@ static irqreturn_t irqhandler(int irq, void  *info)
 							tasklet_schedule(&pdx->dpc_video_tasklet[0]);  // tasklet_hi_schedule
 							//printk("Set OnInterrupt %x %d %d\n", 0,tmp,tmp2);
 						}
+						else
+						{
+							pdx->video_data[0]= tmp;
+							pdx->m_nVideoHalfDone[0] =0; 
+							
+						}
 					}
 							
 			 	 	}
@@ -4811,6 +4818,12 @@ static irqreturn_t irqhandler(int irq, void  *info)
 							pdx->m_nVideoBufferIndex[1] =  tmp;
 							pdx->video_data[1]= pdx->m_nVideoBufferIndex[1];
 							tasklet_schedule(&pdx->dpc_video_tasklet[1]);  
+						}
+						else
+						{
+							pdx->video_data[1]= tmp;
+							pdx->m_nVideoHalfDone[1] =0; 
+							
 						}
 					}
 					
@@ -4830,6 +4843,12 @@ static irqreturn_t irqhandler(int irq, void  *info)
 						pdx->video_data[2]= pdx->m_nVideoBufferIndex[2];
 						tasklet_schedule(&pdx->dpc_video_tasklet[2]);  
 					}
+					else
+					{
+						pdx->video_data[2]= tmp;
+						pdx->m_nVideoHalfDone[2] =0; 
+							
+					}
 				}
 				}
 				if((IntState &0x08) == 0x08) // CH1=3  done
@@ -4848,6 +4867,12 @@ static irqreturn_t irqhandler(int irq, void  *info)
 						pdx->video_data[3]= pdx->m_nVideoBufferIndex[3];
 						//printk("OnInterrupt-%x [1] %d\n", 3,video_data[3]);
 						tasklet_schedule(&pdx->dpc_video_tasklet[3]);  
+					}
+					else
+					{
+							pdx->video_data[3]= tmp;
+							pdx->m_nVideoHalfDone[3] =0; 
+							
 					}
 				}
 				}
