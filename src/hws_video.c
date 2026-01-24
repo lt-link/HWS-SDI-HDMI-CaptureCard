@@ -72,6 +72,7 @@ static const struct pci_device_id hws_pci_table[] = {
 	MAKE_ENTRY(0x1F33, 0x6502, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x8504, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x8524, 0x8888, 0x0007, NULL),
+	MAKE_ENTRY(0x8888, 0x8521, 0x8888, 0x0007, NULL),
 	
 	{ }
 };
@@ -1237,7 +1238,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_enum_input = hws_vidioc_enum_input,
 	.vidioc_g_input = hws_vidioc_g_input,
 	.vidioc_s_input = hws_vidioc_s_input,
-	.vidioc_log_status = vidioc_log_status,
+	//.vidioc_log_status = vidioc_log_status,
 	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 	.vidioc_g_parm = hws_vidioc_g_parm,
@@ -5853,6 +5854,7 @@ switch (pdx->dwDeviceID)
 			break;
 	  }
 	  case 0x8501:
+	  case 0x8521:
 	  {
 	  		pdx->m_nCurreMaxVideoChl = 1;
 			pdx->m_nCurreMaxLineInChl =0;
