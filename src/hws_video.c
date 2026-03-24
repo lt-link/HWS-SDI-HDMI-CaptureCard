@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
-*/
+ * Longtimetech HWS V4L2 driver
+ * Copyright (C) 2025 Longtimetech
+ */
 
 #include <linux/pci.h>
 #include <linux/kernel.h>
@@ -8,13 +11,16 @@
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-vmalloc.h>
 #include <media/videobuf2-dma-contig.h>
-#include "hws.h"
-#include "hws_reg.h"
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
 #include <sound/rawmidi.h>
 #include <sound/initval.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-device.h>
+#include "hws.h"
+#include "hws_reg.h"
+#include "hws_compat.h"
 
 static void hws_adapters_init(struct hws_pcie_dev *dev);
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index);
@@ -654,7 +660,7 @@ static int hws_open(struct file *file)
     /* v4l2 file-handle */
     v4l2_fh_init(&ctx->fh, &videodev->vdev);
     file->private_data = &ctx->fh;
-    v4l2_fh_add(&ctx->fh);
+    HWS_V4L2_FH_ADD(&ctx->fh, file);
 
     /* per-file vb2 queue */
     q = &ctx->vbq;
@@ -667,12 +673,12 @@ static int hws_open(struct file *file)
     q->ops = &hwspcie_video_multi_qops;
     q->mem_ops = &vb2_vmalloc_memops;
     q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-    q->lock = NULL; /* we use our own locks */
+    q->lock = &videodev->queue_lock; /* we use our own locks */
     q->dev = &pdx->pdev->dev;
 
     ret = vb2_queue_init(q);
     if (ret) {
-        v4l2_fh_del(&ctx->fh);
+        HWS_V4L2_FH_DEL(&ctx->fh,file);
         v4l2_fh_exit(&ctx->fh);
         kfree(ctx);
         file->private_data = NULL;
@@ -717,13 +723,14 @@ static int hws_release(struct file *file)
     vb2_queue_release(&ctx->vbq);
 
     /* v4l2 fh cleanup */
-    v4l2_fh_del(&ctx->fh);
+    HWS_V4L2_FH_DEL(&ctx->fh,file);
     v4l2_fh_exit(&ctx->fh);
     file->private_data = NULL;
 
     kfree(ctx);
     return 0;
 }
+
 //-------------------
 static const struct v4l2_queryctrl g_no_ctrl = {
 	.name  = "42",
@@ -828,32 +835,85 @@ static struct v4l2_queryctrl *find_ctrl(unsigned int id)
 
 	return 0;
 }
-#if 0
-static unsigned int find_Next_Ctl_ID(unsigned int id)
+//-----------------------------
+
+static struct v4l2_query_ext_ctrl g_hws_ext_ctrls[] = {
+    {
+        .id = V4L2_CID_BRIGHTNESS,
+        .type = V4L2_CTRL_TYPE_INTEGER,
+        .name = "Brightness",
+        .minimum = MIN_VAMP_BRIGHTNESS_UNITS,
+        .maximum = MAX_VAMP_BRIGHTNESS_UNITS,
+        .step = 1,
+        .default_value = BrightnessDefault,
+        .flags = 0,
+        .elem_size = sizeof(s32),
+        .dims = {0},
+        .nr_of_dims = 0,
+    },
+    {
+        .id = V4L2_CID_CONTRAST,
+        .type = V4L2_CTRL_TYPE_INTEGER,
+        .name = "Contrast",
+        .minimum = MIN_VAMP_CONTRAST_UNITS,
+        .maximum = MAX_VAMP_CONTRAST_UNITS,
+        .step = 1,
+        .default_value = ContrastDefault,
+        .flags = 0,
+        .elem_size = sizeof(s32),
+        .dims = {0},
+        .nr_of_dims = 0,
+    },
+    {
+        .id = V4L2_CID_SATURATION,
+        .type = V4L2_CTRL_TYPE_INTEGER,
+        .name = "Saturation",
+        .minimum = MIN_VAMP_SATURATION_UNITS,
+        .maximum = MAX_VAMP_SATURATION_UNITS,
+        .step = 1,
+        .default_value = SaturationDefault,
+        .flags = 0,
+        .elem_size = sizeof(s32),
+        .dims = {0},
+        .nr_of_dims = 0,
+    },
+    {
+        .id = V4L2_CID_HUE,
+        .type = V4L2_CTRL_TYPE_INTEGER,
+        .name = "Hue",
+        .minimum = MIN_VAMP_HUE_UNITS,
+        .maximum = MAX_VAMP_HUE_UNITS,
+        .step = 1,
+        .default_value = HueDefault,
+        .flags = 0,
+        .elem_size = sizeof(s32),
+        .dims = {0},
+        .nr_of_dims = 0,
+    },
+};
+#define ARRAY_SIZE_OF_EXT_CTRL (sizeof(g_hws_ext_ctrls) / sizeof(g_hws_ext_ctrls[0]))
+static struct v4l2_query_ext_ctrl *find_ext_ctrl(unsigned int id)
 {
-	int i;
-	int nextID =-1;
-	int curr_index =-1;
-	//scan supported queryctrl table
-	for( i=0; i<ARRAY_SIZE_OF_CTRL; i++ )
-	{
-		if(g_hws_ctrls[i].id==id)
-		{
-			curr_index = i;
-			break;
-		}
-	}
-	if(curr_index != -1)
-	{
-		if((curr_index +1)<ARRAY_SIZE_OF_CTRL)
-		{
-			nextID = g_hws_ctrls[curr_index +1].id;
-		}
-	}
-	return nextID;
+    int i;
+    for (i = 0; i < ARRAY_SIZE_OF_EXT_CTRL; i++) {
+        if (g_hws_ext_ctrls[i].id == id) {
+            return &g_hws_ext_ctrls[i];
+        }
+    }
+    return NULL;
 }
-#endif 
-int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)//
+
+//
+static struct v4l2_query_ext_ctrl *find_ext_ctrlByIndex(int index)
+{
+    if (index >= 0 && index < ARRAY_SIZE_OF_EXT_CTRL) {
+        return &g_hws_ext_ctrls[index];
+    }
+    return NULL;
+}
+//-------------------------
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
+static int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)//
 {
 	struct hws_video *videodev = video_drvdata(file);
 	struct v4l2_control *ctrl = a;
@@ -909,8 +969,47 @@ int hws_vidioc_g_ctrl(struct file *file, void *fh,struct v4l2_control *a)//
 	return ret;
 
 }
+#else 
+static int hws_v4l2_g_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_controls  *cs)//
+{
+	struct hws_video *videodev = video_drvdata(file);
+    int i;
+	if(cs ==NULL)
+	{
+		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
+		return -EINVAL;
+	}
+	//printk( "%s(ch-%d)-%d\n", __func__,videodev->index,cs->count);
+	return  -ERANGE;
+    for (i = 0; i < cs->count; i++) {
+        struct v4l2_ext_control *c = &cs->controls[i];
+        
+        switch (c->id) {
+            case V4L2_CID_BRIGHTNESS:
+                c->value = videodev->m_Curr_Brightness;
+                break;
+            case V4L2_CID_CONTRAST:
+                c->value = videodev->m_Curr_Contrast;
+                break;
+            case V4L2_CID_SATURATION:
+                c->value = videodev->m_Curr_Saturation;
+                break;
+            case V4L2_CID_HUE:
+                c->value = videodev->m_Curr_Hue;
+                break;
+            default:
+                // 设置错误索引并返回
+                cs->error_idx = i;
+                printk("Unsupported control id: 0x%x\n", c->id);
+                return -EINVAL;
+        }
+    }
+    return 0;
 
-int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
+}
+#endif 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
+static int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	struct v4l2_control *ctrl = a;
@@ -968,10 +1067,65 @@ int hws_vidioc_s_ctrl(struct file *file, void *fh,struct v4l2_control *a)
 	return ret;
 
 }
+#else 
+static int hws_v4l2_s_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_controls  *cs)
+{
+	struct hws_video *videodev = video_drvdata(file);
+    int i;
+	if(cs ==NULL)
+	{
+		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
+		return -EINVAL;
+	}
+	printk( "%s(ch-%d)-%d\n", __func__,videodev->index,cs->count);
+	return  -ERANGE;
+    for (i = 0; i < cs->count; i++) {
+        struct v4l2_ext_control *c = &cs->controls[i];
+        struct v4l2_query_ext_ctrl *found_ctrl;
+        
+        found_ctrl = find_ext_ctrl(c->id);
+        if (!found_ctrl) {
+            cs->error_idx = i;
+            printk("Control not found: 0x%x\n", c->id);
+            return -EINVAL;
+        }
+        
+        // 检查值范围
+        if (c->value < found_ctrl->minimum || c->value > found_ctrl->maximum) {
+            cs->error_idx = i;
+            printk("Value out of range for control 0x%x (%lld-%lld)\n",
+                   c->id, found_ctrl->minimum, found_ctrl->maximum);
+            return -ERANGE;
+        }
+        
+        // 根据ID设置值
+        switch (c->id) {
+            case V4L2_CID_BRIGHTNESS:
+                videodev->m_Curr_Brightness = c->value;
+                break;
+            case V4L2_CID_CONTRAST:
+                videodev->m_Curr_Contrast = c->value;
+                break;
+            case V4L2_CID_HUE:
+                videodev->m_Curr_Hue = c->value;
+                break;
+            case V4L2_CID_SATURATION:
+                videodev->m_Curr_Saturation = c->value;
+                break;
+            default:
+                cs->error_idx = i;
+                return -EINVAL;
+        }
+    }
+    return 0;
+
+}
+#endif 
 void mem_model_memset(void *s,int c,unsigned int n)
 {
     memset(s,c,n);
 }
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
 static int hws_vidioc_queryctrl(struct file *file, void *fh,struct v4l2_queryctrl *a)
 {
 	struct hws_video *videodev = video_drvdata(file);
@@ -1036,6 +1190,62 @@ static int hws_vidioc_queryctrl(struct file *file, void *fh,struct v4l2_queryctr
 	return ret;
 
 }
+#else
+static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh,struct v4l2_query_ext_ctrl  *qc)
+{
+	struct hws_video *videodev = video_drvdata(file);
+    struct v4l2_query_ext_ctrl *found_ctrl;
+    unsigned int id;
+    unsigned int mask_id;
+    int ret = -EINVAL;
+	if(qc ==NULL)
+	{
+		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
+		return ret;
+	}
+	printk( "%s(ch-%d)\n", __func__,videodev->index);
+	
+    id = qc->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
+    mask_id = qc->id & V4L2_CTRL_FLAG_NEXT_CTRL;
+	printk( "id= %d mask_id=%dn",id ,mask_id);
+	return ret;
+    if (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) {
+        if (id == 0) {
+            videodev->queryIndex = 0;
+            found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
+            if (found_ctrl) {
+                memcpy(qc, found_ctrl, sizeof(*qc));
+                // 清除 NEXT_CTRL 标志
+                qc->id = found_ctrl->id; 
+                ret = 0;
+            }
+        } else {
+            videodev->queryIndex++;
+            found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
+            if (found_ctrl) {
+                memcpy(qc, found_ctrl, sizeof(*qc));
+                qc->id = found_ctrl->id;
+                ret = 0;
+            } else {
+                // 返回空控制项表示结束
+                memset(qc, 0, sizeof(*qc));
+                ret = -EINVAL;
+            }
+        }
+    } else {
+        found_ctrl = find_ext_ctrlByIndex(id);
+        if (found_ctrl) {
+            memcpy(qc, found_ctrl, sizeof(*qc));
+            ret = 0;
+        } else {
+            memset(qc, 0, sizeof(*qc));
+            ret = -EINVAL;
+        }
+    }
+    return ret;
+
+}
+#endif 
 #if 0
 static int hws_vidioc_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
 {
@@ -1232,17 +1442,27 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_s_std = hws_vidioc_s_std,
 	.vidioc_enum_framesizes   	= hws_vidioc_enum_framesizes,
 	.vidioc_enum_frameintervals = hws_vidioc_enum_frameintervals,
-	.vidioc_g_ctrl        		= hws_vidioc_g_ctrl,
-	.vidioc_s_ctrl        		= hws_vidioc_s_ctrl,
-	.vidioc_queryctrl           = hws_vidioc_queryctrl,
+	#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
+		.vidioc_g_ctrl	   = hws_vidioc_g_ctrl,
+		.vidioc_s_ctrl	   = hws_vidioc_s_ctrl,
+		.vidioc_queryctrl  = hws_vidioc_queryctrl,
+		.vidioc_g_parm 	   = hws_vidioc_g_parm,
+		.vidioc_s_parm     = hws_vidioc_s_parm,
+	#else
+		.vidioc_g_ext_ctrls =  hws_v4l2_g_ext_ctrls,
+		.vidioc_s_ext_ctrls =  hws_v4l2_s_ext_ctrls,
+		.vidioc_query_ext_ctrl =  hws_v4l2_query_ext_ctrl,
+		.vidioc_g_parm 	   = hws_vidioc_g_parm,
+		.vidioc_s_parm     = hws_vidioc_s_parm,
+	#endif
+
 	.vidioc_enum_input = hws_vidioc_enum_input,
 	.vidioc_g_input = hws_vidioc_g_input,
 	.vidioc_s_input = hws_vidioc_s_input,
 	//.vidioc_log_status = vidioc_log_status,
 	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
-	.vidioc_g_parm = hws_vidioc_g_parm,
-	.vidioc_s_parm = hws_vidioc_s_parm,
+
 };
 
 static int hws_queue_setup(struct vb2_queue *q,
