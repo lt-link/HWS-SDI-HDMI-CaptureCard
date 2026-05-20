@@ -4489,23 +4489,23 @@ static void StopDevice(struct hws_pcie_dev *pdx)
 	}	
 static void irq_teardown(struct hws_pcie_dev *lro)
 {
-	//int i;
-
-	//BUG_ON(!lro);
-
-	//if (lro->msix_enabled) {
-	//	for (i = 0; i < lro->irq_user_count; i++) {
-	//		printk("Releasing IRQ#%d\n", lro->entry[i].vector);
-	//		free_irq(lro->entry[i].vector, &lro->user_irq[i]);
-	//	}
-	//} 
-	//else 
+	if (!lro)
+		return;
 
 	if (lro->irq_line != -1) {
-		//printk("Releasing IRQ#%d\n", lro->irq_line);
 		free_irq(lro->irq_line, lro);
+		lro->irq_line = -1;
 	}
+
+	if (lro->irq_vectors_allocated) {
+		pci_free_irq_vectors(lro->pdev);
+		lro->irq_vectors_allocated = 0;
+	}
+
+	lro->msi_enabled = 0;
+	lro->msix_enabled = 0;
 }
+
 void StopKSThread(struct hws_pcie_dev *pdx)
 {
 	if(pdx->mMain_tsk)
@@ -4570,16 +4570,7 @@ static void hws_remove(struct pci_dev *pdev)
 	iounmap(dev->info.mem[0].internal_addr);
 	
 	//pci_disable_device(pdev);
-	if (dev->msix_enabled) 
-	{		
-			pci_disable_msix(pdev); 	
-			dev->msix_enabled = 0; 
-	}	
-	else if (dev->msi_enabled)
-	{
-			pci_disable_msi(pdev);		
-			dev->msi_enabled = 0;	
-	}
+	/* IRQ vectors are released in irq_teardown(). */
 	kfree(dev);
 	pci_disable_device(pdev);
 	pci_set_drvdata(pdev, NULL);
@@ -5489,6 +5480,7 @@ static struct hws_pcie_dev *alloc_dev_instance(struct pci_dev *pdev)
 	//lro->user_bar_idx = -1;
 	//lro->bypass_bar_idx = -1;
 	lro->irq_line = -1;
+	lro->irq_vectors_allocated = 0;
 
 	/* create a device to driver reference */
 	dev_set_drvdata(&pdev->dev, lro);
@@ -5901,84 +5893,78 @@ static int msi_msix_capable(struct pci_dev *dev, int type)
 
 static int probe_scan_for_msi(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 {
-	//int i;
-	int rc = 0;
-	//int req_nvec = MAX_NUM_ENGINES + MAX_USER_IRQ;
+	int rc;
 
-	//BUG_ON(!lro);
-	//BUG_ON(!pdev);
-	//if (msi_msix_capable(pdev, PCI_CAP_ID_MSIX)) {
-	//		printk("Enabling MSI-X\n");
-	//		for (i = 0; i < req_nvec; i++)
-	//			lro->entry[i].entry = i;
-	//
-	//		rc = pci_enable_msix(pdev, lro->entry, req_nvec);
-	//		if (rc < 0)
-	//			printk("Couldn't enable MSI-X mode: rc = %d\n", rc);
-	
-	//		lro->msix_enabled = 1;
-	//		lro->msi_enabled = 0;
-	//	} 
-	//else  
+	/*
+	 * Modern PCI IRQ allocation path:
+	 *   1) Prefer MSI.
+	 *   2) If MSI is unavailable or blocked by platform/IOMMU/BIOS policy,
+	 *      fallback to legacy INTx.
+	 *
+	 * Do not use pci_enable_msi() here. On newer systems it may return
+	 * -EINVAL after platform IRQ/MSI policy changes, while INTx is still usable.
+	 */
+	lro->msi_enabled = 0;
+	lro->msix_enabled = 0;
+	lro->irq_vectors_allocated = 0;
 
-	if (msi_msix_capable(pdev, PCI_CAP_ID_MSI)) {
-		/* enable message signalled interrupts */
-		//printk("pci_enable_msi()\n");
-		rc = pci_enable_msi(pdev);
-		if (rc < 0)
-		{
-			printk("Couldn't enable MSI mode: rc = %d\n", rc);
-		}
+	rc = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+	if (rc >= 0) {
 		lro->msi_enabled = 1;
 		lro->msix_enabled = 0;
-	} else {
-		//printk("MSI/MSI-X not detected - using legacy interrupts\n");
-		lro->msi_enabled = 0;
-		lro->msix_enabled = 0;
+		lro->irq_vectors_allocated = 1;
+		printk(KERN_INFO "HWS: MSI IRQ vector allocated, vectors=%d\n", rc);
+		return 0;
 	}
 
+	printk(KERN_WARNING "HWS: MSI alloc failed rc=%d, fallback to INTx\n", rc);
+
+	rc = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_INTX);
+	if (rc >= 0) {
+		lro->msi_enabled = 0;
+		lro->msix_enabled = 0;
+		lro->irq_vectors_allocated = 1;
+		printk(KERN_INFO "HWS: INTx IRQ vector allocated, vectors=%d\n", rc);
+		return 0;
+	}
+
+	printk(KERN_ERR "HWS: INTx IRQ alloc failed rc=%d\n", rc);
 	return rc;
 }
-
 
 
 static int irq_setup(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 {
-	int rc = 0;
-	u32 irq_flag;
+	int rc;
+	int irq;
+	unsigned long irq_flag = 0;
 	u8 val;
-	//void *reg;
-	//u32 w;
 
-	//BUG_ON(!lro);
-
-	//if (lro->msix_enabled) {
-	//	rc = msix_irq_setup(lro);
-	//} 
-	//else 
-	{
-		if (!lro->msi_enabled){
-			pci_read_config_byte(pdev, PCI_INTERRUPT_PIN, &val);
-			//printk("Legacy Interrupt register value = %d\n", val);
-		}
-		//irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
-		irq_flag = lro->msi_enabled ? IRQF_SHARED:0;
-		//irq_flag = IRQF_SHARED;
-		
-		rc = request_irq(pdev->irq, irqhandler, irq_flag, pci_name(pdev), lro); // IRQF_TRIGGER_HIGH 
-		if (rc)
-		{
-			//printk("Couldn't use IRQ#%d, rc=%d\n", pdev->irq, rc);
-		}
-		else
-		{
-			lro->irq_line = (int)pdev->irq;
-			//printk("Using IRQ#%d with  MSI_EN=%d \n", pdev->irq,lro->msi_enabled);
-		}
+	irq = pci_irq_vector(pdev, 0);
+	if (irq < 0) {
+		printk(KERN_ERR "HWS: pci_irq_vector failed irq=%d\n", irq);
+		return irq;
 	}
 
-	return rc;
+	/* MSI/MSI-X IRQs are not shared. Legacy INTx should be shared. */
+	if (!lro->msi_enabled && !lro->msix_enabled) {
+		pci_read_config_byte(pdev, PCI_INTERRUPT_PIN, &val);
+		irq_flag = IRQF_SHARED;
+	}
+
+	rc = request_irq(irq, irqhandler, irq_flag, pci_name(pdev), lro);
+	if (rc) {
+		printk(KERN_ERR "HWS: request_irq failed irq=%d rc=%d flags=0x%lx\n",
+		       irq, rc, irq_flag);
+		return rc;
+	}
+
+	lro->irq_line = irq;
+	printk(KERN_INFO "HWS: Using IRQ#%d MSI=%d MSI-X=%d flags=0x%lx\n",
+	       irq, lro->msi_enabled, lro->msix_enabled, irq_flag);
+	return 0;
 }
+
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
 static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
@@ -6379,24 +6365,15 @@ err_mem_alloc:
 err_register:
 		iounmap(gdev->info.mem[0].internal_addr);
 		irq_teardown(gdev);
-disable_msi:	
-		if (gdev->msix_enabled) 
-		{		
-		pci_disable_msix(pdev); 	
-		gdev->msix_enabled = 0; 
-		}	
-		else if (gdev->msi_enabled)
-		{
-			pci_disable_msi(pdev);		
-			gdev->msi_enabled = 0;	
-		}
-err_release:
 		kfree(gdev);
+disable_msi:	
+		/* IRQ vectors are released in irq_teardown(). */
+err_release:
 		pci_release_regions(pdev);
 		pci_disable_device(pdev);
 		return err;
 err_alloc:
-		kfree(gdev);
+			kfree(gdev);
 			
 	return	-1;
 
