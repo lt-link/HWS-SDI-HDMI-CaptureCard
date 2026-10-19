@@ -6,6 +6,7 @@
 
 #include <linux/pci.h>
 #include <linux/kernel.h>
+#include <linux/ratelimit.h>
 #include <media/videobuf2-core.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-dma-contig.h>
@@ -31,6 +32,38 @@ static int StartAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopVideoCapture(struct hws_pcie_dev *pdx,int index);
 static void InitVideoSys(struct hws_pcie_dev *pdx,int set);
+
+/* No per-frame logging. All diagnostics below are event-only and rate limited. */
+#define HWS_FIX_VERSION "1.0.1-20260929"
+#define HWS_FRAME_CAPACITY ((size_t)MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2)
+
+static bool hws_frame_bytes(int w, int h, size_t *bytes)
+{
+    /* Also permits the existing 1080x1920 portrait output. */
+    if (w <= 0 || h <= 0 || (w & 1) || (h & 1) ||
+        w > MAX_VIDEO_HW_W || h > MAX_VIDEO_HW_W)
+        return false;
+    *bytes = (size_t)w * h * 2;
+    return *bytes <= HWS_FRAME_CAPACITY;
+}
+
+/* Caller holds ioctl_lock; release uses the same lock. No sleeping under spinlock. */
+static bool hws_channel_buffers_busy(struct hws_video *video)
+{
+    struct hws_vfh_ctx *ctx;
+    unsigned long flags;
+    bool busy = false;
+
+    spin_lock_irqsave(&video->consumers_lock, flags);
+    list_for_each_entry(ctx, &video->consumers, node) {
+        if (vb2_is_busy(&ctx->vbq)) {
+            busy = true;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&video->consumers_lock, flags);
+    return busy;
+}
 
 //------------------------
 
@@ -456,7 +489,25 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,struct v4l2_format
 	err = hws_vidioc_try_fmt_vid_cap(file, priv, f);
 	if (0 != err)
 		return err;
-	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);	
+    {
+        size_t bytes;
+        bool changed = f->fmt.pix.width != videodev->current_out_width ||
+                       f->fmt.pix.height != videodev->curren_out_height ||
+                       f->fmt.pix.pixelformat != videodev->pixfmt;
+        if (!hws_frame_bytes(f->fmt.pix.width, f->fmt.pix.height, &bytes))
+            return -EINVAL;
+        if (changed && hws_channel_buffers_busy(videodev)) {
+            pr_warn_ratelimited("HwsCapture ch%d: S_FMT %ux%u rejected: buffers allocated (current %ux%u)\n",
+                videodev->index, f->fmt.pix.width, f->fmt.pix.height,
+                videodev->current_out_width, videodev->curren_out_height);
+            return -EBUSY;
+        }
+        if (changed)
+            pr_info_ratelimited("HwsCapture ch%d: output %ux%u -> %ux%u\n",
+                videodev->index, videodev->current_out_width,
+                videodev->curren_out_height, f->fmt.pix.width, f->fmt.pix.height);
+    }
+	spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
 	videodev->current_out_size_index = nVideoFmtIndex;
 	videodev->pixfmt     = f->fmt.pix.pixelformat;
 	videodev->current_out_width      = f->fmt.pix.width;
@@ -699,35 +750,31 @@ static int hws_open(struct file *file)
 static int hws_release(struct file *file)
 {
     struct hws_vfh_ctx *ctx;
-    struct hws_video *videodev;
+    struct hws_video *video;
     struct hws_pcie_dev *pdx;
     unsigned long flags;
 
     if (!file->private_data)
         return 0;
-
     ctx = hws_ctx_from_file(file);
-    videodev = ctx->video;
-    pdx = videodev->dev;
-    spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
-    if (videodev->fileindex > 0)
-        videodev->fileindex--;
-    spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+    video = ctx->video;
+    pdx = video->dev;
+    mutex_lock(&video->ioctl_lock);
+    spin_lock_irqsave(&pdx->videoslock[video->index], flags);
+    spin_lock(&video->consumers_lock);
+    list_del_init(&ctx->node);
+    spin_unlock(&video->consumers_lock);
+    if (video->fileindex > 0)
+        video->fileindex--;
+    spin_unlock_irqrestore(&pdx->videoslock[video->index], flags);
 
-    /* remove from consumers */
-    spin_lock_irqsave(&videodev->consumers_lock, flags);
-    list_del(&ctx->node);
-    spin_unlock_irqrestore(&videodev->consumers_lock, flags);
-
-    /* release vb2 queue resources */
+    /* No worker can acquire this consumer now; stop callback drains its queue. */
     vb2_queue_release(&ctx->vbq);
-
-    /* v4l2 fh cleanup */
-    HWS_V4L2_FH_DEL(&ctx->fh,file);
+    HWS_V4L2_FH_DEL(&ctx->fh, file);
     v4l2_fh_exit(&ctx->fh);
     file->private_data = NULL;
-
     kfree(ctx);
+    mutex_unlock(&video->ioctl_lock);
     return 0;
 }
 
@@ -1203,11 +1250,11 @@ static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh,struct v4l2_query
 		printk( "%s(ch-%d)cs=NULL\n", __func__,videodev->index);
 		return ret;
 	}
-	printk( "%s(ch-%d)\n", __func__,videodev->index);
+	pr_debug("%s(ch-%d)\n", __func__, videodev->index);
 	
     id = qc->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
     mask_id = qc->id & V4L2_CTRL_FLAG_NEXT_CTRL;
-	printk( "id= %d mask_id=%dn",id ,mask_id);
+	pr_debug("HwsCapture query ctrl id=%u mask=%u\n", id, mask_id);
 	return ret;
     if (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) {
         if (id == 0) {
@@ -1365,16 +1412,16 @@ static long hws_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned lon
     return ret;
 }
 
-static __poll_t hws_poll(struct file *file, struct poll_table_struct *wait)
+static hws_poll_t  hws_poll(struct file *file, struct poll_table_struct *wait)
 {
     struct v4l2_fh *fh = file->private_data;
     struct hws_vfh_ctx *ctx;
     struct hws_video *videodev;
     struct vb2_queue *oldq;
-    __poll_t ret;
+    hws_poll_t  ret;
 
     if (!fh)
-        return EPOLLERR;
+        return HWS_POLLERR;
     ctx = container_of(fh, struct hws_vfh_ctx, fh);
     videodev = ctx->video;
 
@@ -1645,20 +1692,26 @@ static int hws_queue_setup_multi(struct vb2_queue *q,
     struct hws_video *videodev = ctx->video;
     struct hws_pcie_dev *pdx = videodev->dev;
     unsigned long flags;
-    unsigned int size;
+    size_t size;
+    bool valid;
 
     spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
-    size = 2 * videodev->current_out_width * videodev->curren_out_height;
+    valid = hws_frame_bytes(videodev->current_out_width,
+                            videodev->curren_out_height, &size);
     spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+    if (!valid)
+        return -EINVAL;
 
     if (*num_planes) {
-        if (sizes[0] < size)
+        if (*num_planes != 1 || sizes[0] < size)
             return -EINVAL;
         return 0;
     }
 
     *num_planes = 1;
     sizes[0] = size;
+    pr_info_ratelimited("HwsCapture ch%d: queue buffers=%u bytes=%zu\n",
+                        videodev->index, *num_buffers, size);
     return 0;
 }
 
@@ -1670,18 +1723,22 @@ static int hws_buffer_prepare_multi(struct vb2_buffer *vb)
     struct hws_video *videodev = ctx->video;
     struct hws_pcie_dev *pdx = videodev->dev;
     unsigned long flags;
-    u32 size;
+    size_t size;
+    bool valid;
 
     spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
-    size = 2 * videodev->current_out_width * videodev->curren_out_height;
+    valid = hws_frame_bytes(videodev->current_out_width,
+                            videodev->curren_out_height, &size);
     spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+    if (!valid)
+        return -EINVAL;
 
     if (vb2_plane_size(vb, 0) < size)
         return -EINVAL;
 
     vb2_set_plane_payload(vb, 0, size);
     buf->mem = vb2_plane_vaddr(vb, 0);
-    return 0;
+    return buf->mem ? 0 : -EFAULT;
 }
 
 static void hws_buffer_queue_multi(struct vb2_buffer *vb)
@@ -1699,39 +1756,52 @@ static void hws_buffer_queue_multi(struct vb2_buffer *vb)
 static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
 {
     struct hws_vfh_ctx *ctx = q->drv_priv;
-    struct hws_video *videodev = ctx->video;
+    struct hws_video *video = ctx->video;
+    unsigned long flags;
+    int users;
 
-    ctx->streaming = true;
-
-    /* Start hardware engine only once, on first streamer */
-    if (atomic_inc_return(&videodev->engine_users) == 1) {
-        videodev->seqnr = 0;
-        StartVideoCapture(videodev->dev, videodev->index);
+    spin_lock_irqsave(&video->dev->videoslock[video->index], flags);
+    users = atomic_inc_return(&video->engine_users);
+    if (users == 1) {
+        video->seqnr = 0;
+        StartVideoCapture(video->dev, video->index);
     }
+    ctx->streaming = true;
+    spin_unlock_irqrestore(&video->dev->videoslock[video->index], flags);
+    pr_info_ratelimited("HwsCapture ch%d: stream on users=%d output=%ux%u build=%s\n",
+        video->index, users, video->current_out_width,
+        video->curren_out_height, HWS_FIX_VERSION);
     return 0;
 }
 
 static void hws_stop_streaming_multi(struct vb2_queue *q)
 {
     struct hws_vfh_ctx *ctx = q->drv_priv;
-    struct hws_video *videodev = ctx->video;
+    struct hws_video *video = ctx->video;
     struct hwsvideo_buffer *buf;
     unsigned long flags;
+    int users;
 
-    ctx->streaming = false;
-
-    /* Return all pending buffers for this ctx */
-    spin_lock_irqsave(&ctx->qlock, flags);
+    /* Worker holds this lock through buffer_done. Acquiring it is the
+     * in-flight completion barrier; do not cancel_work_sync under this lock. */
+    spin_lock_irqsave(&video->dev->videoslock[video->index], flags);
+    if (ctx->streaming) {
+        ctx->streaming = false;
+        users = atomic_dec_return(&video->engine_users);
+        if (users == 0)
+            StopVideoCapture(video->dev, video->index);
+    } else {
+        users = atomic_read(&video->engine_users);
+    }
+    spin_lock(&ctx->qlock);
     while (!list_empty(&ctx->buf_queue)) {
         buf = list_first_entry(&ctx->buf_queue, struct hwsvideo_buffer, queue);
         list_del(&buf->queue);
         vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
     }
-    spin_unlock_irqrestore(&ctx->qlock, flags);
-
-    /* Stop engine when the last streamer goes away */
-    if (atomic_dec_return(&videodev->engine_users) == 0)
-        StopVideoCapture(videodev->dev, videodev->index);
+    spin_unlock(&ctx->qlock);
+    spin_unlock_irqrestore(&video->dev->videoslock[video->index], flags);
+    pr_info_ratelimited("HwsCapture ch%d: stream off users=%d\n", video->index, users);
 }
 
 static const struct vb2_ops hwspcie_video_multi_qops = {
@@ -2521,7 +2591,7 @@ void V1280X1024_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int
 		y= y+1;
    }
 }
-static void VideoRotate90deg(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
+static int VideoRotate90deg(BYTE *pSrc, BYTE *pOut, int in_w, int in_h, int out_w, int out_h, size_t src_capacity, size_t dst_capacity)
 
 {
 	int x,y;
@@ -2529,6 +2599,12 @@ static void VideoRotate90deg(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,i
 	BYTE*pDestBuf;
 	BYTE *pSrcData;
 	BYTE *pDestData;
+    size_t src_bytes, dst_bytes;
+    if (!pSrc || !pOut || in_w != out_h || in_h != out_w ||
+        !hws_frame_bytes(in_w, in_h, &src_bytes) ||
+        !hws_frame_bytes(out_w, out_h, &dst_bytes) ||
+        src_capacity < src_bytes || dst_capacity < dst_bytes)
+        return -EINVAL;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 	//DbgPrint("[MV]VideoRotate90deg %dX%d->%dX%d\n",in_w,in_h,out_w,out_h);
@@ -2562,6 +2638,7 @@ static void VideoRotate90deg(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,i
    }
 
 
+    return 0;
 }
 
 static void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
@@ -3074,10 +3151,17 @@ static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	}
 }
 //-----------
-static void SetDeInterlace(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
+static int SetDeInterlace(BYTE *pSrc, BYTE *pOut, int nw, int nh, int interlace, size_t src_capacity, size_t dst_capacity)
 {
 	int dwSrcPitch = nw*2;
 	int h;
+    size_t bytes, src_bytes;
+    if (!pSrc || !pOut || (interlace != 0 && interlace != 1) ||
+        !hws_frame_bytes(nw, nh, &bytes))
+        return -EINVAL;
+    src_bytes = interlace ? bytes / 2 : bytes;
+    if (src_capacity < src_bytes || dst_capacity < bytes)
+        return -EINVAL;
 	//DbgPrint("[MV]SetDeInterlace W=%d H=%d interlace=%d \n",nw,nh,interlace);
 	if(interlace==0)
 	{
@@ -3085,10 +3169,8 @@ static void SetDeInterlace(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	}
 	else
 	{
-		if(nh>=1080)
-		{
-			nh = nh/2;
-		}
+        /* nh is full-frame height, including 480i/576i. */
+        nh /= 2;
 		for( h=0; h <nh; h++)
 		{
 			memcpy(pOut,pSrc,dwSrcPitch);
@@ -3099,6 +3181,7 @@ static void SetDeInterlace(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 		}
 	}
 
+    return 0;
 }
 //----------------------------------------------------------------
 static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
@@ -3324,37 +3407,33 @@ static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 }
 
 //--------------------------------
-static struct hwsvideo_buffer *hws_pop_any_buffer(struct hws_video *videodev, struct hws_vfh_ctx **out_ctx)
+/* Caller holds videoslock through completion, excluding streamoff/release. */
+static void hws_collect_frame_buffers(struct hws_video *videodev,
+                                      struct list_head *frame_buffers)
 {
     struct hws_vfh_ctx *ctx;
-    struct hwsvideo_buffer *buf = NULL;
     unsigned long flags;
-
-    *out_ctx = NULL;
 
     spin_lock_irqsave(&videodev->consumers_lock, flags);
     list_for_each_entry(ctx, &videodev->consumers, node) {
+        struct hwsvideo_buffer *buf;
         unsigned long qflags;
+
         if (!ctx->streaming)
             continue;
         spin_lock_irqsave(&ctx->qlock, qflags);
         if (!list_empty(&ctx->buf_queue)) {
+            /* Reserve one buffer per consumer; requeues wait for the next frame. */
             buf = list_first_entry(&ctx->buf_queue, struct hwsvideo_buffer, queue);
-            list_del(&buf->queue);
-            *out_ctx = ctx;
-            spin_unlock_irqrestore(&ctx->qlock, qflags);
-            break;
+            list_move_tail(&buf->queue, frame_buffers);
         }
         spin_unlock_irqrestore(&ctx->qlock, qflags);
     }
     spin_unlock_irqrestore(&videodev->consumers_lock, flags);
-
-    return buf;
 }
 void video_data_process(struct work_struct *p_work)
 {
 	struct hws_video *videodev = container_of(p_work, struct hws_video, videowork);
-	struct hwsvideo_buffer *buf;
 	//unsigned long flags;
 	unsigned long devflags;
 	int nVindex=-1;
@@ -3371,45 +3450,25 @@ void video_data_process(struct work_struct *p_work)
 	int needRotateVideo =0;
 	int nWidth;
 	int nHeight;
+    bool no_video;
+    size_t required, source_bytes;
+    LIST_HEAD(frame_buffers);
+    u64 frame_timestamp;
+    unsigned int frame_sequence;
 	struct hws_pcie_dev *pdx = videodev->dev;
 	nDecoder = videodev->index;
 	
 	spin_lock_irqsave(&pdx->videoslock[nDecoder], devflags);
-	in_width = pdx->m_pVCAPStatus[nDecoder][0].dwWidth ;
-	in_height = pdx->m_pVCAPStatus[nDecoder][0].dwHeight;
-	nWidth  = videodev->current_out_width;
-	nHeight = videodev->curren_out_height;
-	out_size = videodev->current_out_width*videodev->curren_out_height*2;
-	if(pdx->m_Device_SupportYV12 == 1)
-	{
-			nCopySize = ((in_width*12*in_height)/8);
-	}
-	else if(pdx->m_Device_SupportYV12 == 2)
-	{
-			nCopySize =((in_width*5*in_height)/4);
-	}
-	else
-	{
-			nCopySize = (in_width*in_height*2);
-	}
-		
-	if(pdx->m_pVCAPStatus[nDecoder][0].dwinterlace ==1)
-	{
-			in_height = in_height*2;
-	}
-	in_vsize = in_width*in_height*2;
-	if((in_width == 1280)&&(in_height==720)&&(nWidth==1080)&&(nHeight==1920))
-	{
-			needRotateVideo =1;
-	}
-	else if((in_width == 960)&&(in_height==540)&&(nWidth==1080)&&(nHeight==1920))
-	{
-			needRotateVideo =1;
-	}
-	//printk("video_data_process [%d]dev->m_curr_No_Video[videodev->index] =%d \n",videodev->index,dev->m_curr_No_Video[videodev->index]);
-	//---------------------------
+    no_video = pdx->m_curr_No_Video[nDecoder] != 0;
+    nWidth = videodev->current_out_width;
+    nHeight = videodev->curren_out_height;
+    if (!hws_frame_bytes(nWidth, nHeight, &required)) {
+        pr_warn_ratelimited("HwsCapture ch%d: invalid output %dx%d\n", nDecoder, nWidth, nHeight);
+        goto vexit;
+    }
+    out_size = required;
 	bBuf = NULL;
-	if(pdx->m_curr_No_Video[nDecoder]==0 )
+	if(!no_video )
 	{
 		nVindex = -1;
 		for( i = pdx->m_nRDVideoIndex[nDecoder];i<MAX_VIDEO_QUEUE;i++)
@@ -3418,7 +3477,9 @@ void video_data_process(struct work_struct *p_work)
 			{
 		    	nVindex = i;
 				bBuf =  pdx->m_VideoInfo[nDecoder].m_pVideoBufData[i];
-				interlace = pdx->m_VideoInfo[nDecoder].pStatusInfo[i].dwinterlace;
+                in_width = pdx->m_VideoInfo[nDecoder].pStatusInfo[i].dwWidth;
+                in_height = pdx->m_VideoInfo[nDecoder].pStatusInfo[i].dwHeight;
+                interlace = pdx->m_VideoInfo[nDecoder].pStatusInfo[i].dwinterlace;
 				break;
 			}
 		}
@@ -3431,8 +3492,8 @@ void video_data_process(struct work_struct *p_work)
 		if(bBuf == NULL)
 		{
 			//printk("video_data_process pSrc == NULL [%d]\n",videodev->index);
-			spin_unlock_irqrestore(&pdx->videoslock[nDecoder], devflags);
-			return;
+            pr_warn_ratelimited("HwsCapture ch%d: frame slot %d has NULL data\n", nDecoder, nVindex);
+            goto vexit;
 		}
 	}
 	else
@@ -3448,31 +3509,68 @@ void video_data_process(struct work_struct *p_work)
 		//spin_unlock_irqrestore(&pdx->videoslock[nDecoder], devflags);
 	}
 	
-    for (;;) {
-        struct hws_vfh_ctx *ctx;
+    if (!no_video) {
+        /* Frame metadata belongs to the selected slot, not the latest signal. */
+        if (interlace != 0 && interlace != 1)
+            goto bad_frame;
+        if (in_width <= 0 || in_width > MAX_VIDEO_HW_W || in_height <= 0 ||
+            in_height > MAX_VIDEO_HW_H / (interlace ? 2 : 1))
+            goto bad_frame;
+        source_bytes = (size_t)in_width * in_height;
+        if (pdx->m_Device_SupportYV12 == 1)
+            source_bytes = source_bytes * 3 / 2;
+        else if (pdx->m_Device_SupportYV12 == 2)
+            source_bytes = source_bytes * 5 / 4;
+        else
+            source_bytes *= 2;
+        if (source_bytes > pdx->m_MaxHWVideoBufferSize ||
+            source_bytes > HWS_FRAME_CAPACITY)
+            goto bad_frame;
+        nCopySize = source_bytes;
+        if (interlace)
+            in_height *= 2;
+        if (!hws_frame_bytes(in_width, in_height, &source_bytes))
+            goto bad_frame;
+        in_vsize = source_bytes;
+        if (!bBuf || !pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf ||
+            !pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf ||
+            !pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf)
+            goto bad_frame;
+        needRotateVideo = nWidth == 1080 && nHeight == 1920 &&
+            ((in_width == 1280 && in_height == 720) ||
+             (in_width == 960 && in_height == 540));
+    }
+
+    frame_timestamp = ktime_get_ns();
+    frame_sequence = videodev->seqnr++;
+    hws_collect_frame_buffers(videodev, &frame_buffers);
+    while (!list_empty(&frame_buffers)) {
         struct hwsvideo_buffer *buf;
 
-        /* We cannot hold pdx spinlock while taking other locks. So: keep pdx lock held,
-         * but hws_pop_any_buffer only takes spinlocks (OK). */
-        buf = hws_pop_any_buffer(videodev, &ctx);
-        if (!buf)
-            break;
+        buf = list_first_entry(&frame_buffers, struct hwsvideo_buffer, queue);
+        list_del_init(&buf->queue);
 
-        buf->vb.vb2_buf.timestamp = ktime_get_ns();
+        buf->vb.vb2_buf.timestamp = frame_timestamp;
         buf->vb.field = V4L2_FIELD_NONE;
 
-        if (!buf->mem) {
+        if (!buf->mem || vb2_plane_size(&buf->vb.vb2_buf, 0) < required) {
+            pr_warn_ratelimited("HwsCapture ch%d: drop small/invalid buffer output=%dx%d need=%zu capacity=%lu\n",
+                nDecoder, nWidth, nHeight, required,
+                (unsigned long)vb2_plane_size(&buf->vb.vb2_buf, 0));
+            vb2_set_plane_payload(&buf->vb.vb2_buf, 0, 0);
             vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
             continue;
         }
 		// copy data to buffer 
-		if(pdx->m_curr_No_Video[nDecoder]==0 )
+		if(!no_video )
 		{
 			
 			//--------------------
 			if(pdx->m_Device_SupportYV12 == 1)
 			{
-			if((in_vsize != out_size))
+			if (in_vsize != out_size ||
+                ((in_width != nWidth || in_height != nHeight) &&
+                 !(in_width == nHeight && in_height == nWidth)))
 			{
 				if(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf)
 				{
@@ -3488,8 +3586,10 @@ void video_data_process(struct work_struct *p_work)
 						{
 							memcpy(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,bBuf,nCopySize); 
 							FillYUU2(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,in_width,in_height,interlace);
-							VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,nWidth,nHeight);
-							VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight);
+							VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,nHeight,nWidth);
+							if (VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight, HWS_FRAME_CAPACITY,
+                                vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                                goto buffer_error;
 						}
 						else
 						{
@@ -3513,7 +3613,9 @@ void video_data_process(struct work_struct *p_work)
 					{
 							memcpy(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,bBuf,nCopySize); 
 							FillYUU2(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,interlace);
-							VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight);
+							if (VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight, HWS_FRAME_CAPACITY,
+                                vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                                goto buffer_error;
 					}
 					else
 					{
@@ -3531,7 +3633,9 @@ void video_data_process(struct work_struct *p_work)
 		}
 		else if(pdx->m_Device_SupportYV12 == 2)
 		{
-			if((in_vsize != out_size))
+			if (in_vsize != out_size ||
+                ((in_width != nWidth || in_height != nHeight) &&
+                 !(in_width == nHeight && in_height == nWidth)))
 			{
 				if(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf)
 				{
@@ -3547,8 +3651,10 @@ void video_data_process(struct work_struct *p_work)
 						{
 							memcpy(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,bBuf,nCopySize); 
 							FillNV12ToYUY2(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,in_width,in_height,interlace);
-							VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,nWidth,nHeight);
-							VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight);
+							VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,nHeight,nWidth);
+							if (VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight, HWS_FRAME_CAPACITY,
+                                vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                                goto buffer_error;
 						}
 						else
 						{
@@ -3571,7 +3677,9 @@ void video_data_process(struct work_struct *p_work)
 					{
 							memcpy(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,bBuf,nCopySize); 
 							FillNV12ToYUY2(pdx->m_VideoInfo[nDecoder].m_pVideoYUV2Buf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,interlace);
-							VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight);
+							if (VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight, HWS_FRAME_CAPACITY,
+                                vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                                goto buffer_error;
 					}
 					else
 					{
@@ -3588,21 +3696,27 @@ void video_data_process(struct work_struct *p_work)
 			}
 		}
 		else
-		{	if((in_vsize != out_size))
+		{	if (in_vsize != out_size ||
+                ((in_width != nWidth || in_height != nHeight) &&
+                 !(in_width == nHeight && in_height == nWidth)))
 			{
 				if(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf)
 				{
 					if(needRotateVideo==0)
 					{
 						//RtlCopyMemory(m_pVideoScalerBuf,bBuf,nCopySize); 
-						SetDeInterlace(bBuf,pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,in_width,in_height,interlace);
+						if (SetDeInterlace(bBuf,pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,in_width,in_height,interlace, nCopySize, HWS_FRAME_CAPACITY))
+                            goto buffer_error;
 						VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,buf->mem,in_width,in_height,nWidth,nHeight);
 					}
 					else
 					{
-						SetDeInterlace(bBuf,pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,in_width,in_height,interlace);
+						if (SetDeInterlace(bBuf,pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,in_width,in_height,interlace, nCopySize, HWS_FRAME_CAPACITY))
+                            goto buffer_error;
 						VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,nHeight,nWidth);
-						VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight);
+						if (VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight, HWS_FRAME_CAPACITY,
+                                vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                                goto buffer_error;
 					}
 				}
 				else
@@ -3617,8 +3731,11 @@ void video_data_process(struct work_struct *p_work)
 				{
 					if(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf)
 					{
-							SetDeInterlace(bBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,interlace);
-							VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight);
+							if (SetDeInterlace(bBuf,pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,in_width,in_height,interlace, nCopySize, HWS_FRAME_CAPACITY))
+                            goto buffer_error;
+							if (VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf,buf->mem,nHeight,nWidth,nWidth,nHeight, HWS_FRAME_CAPACITY,
+                                vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                                goto buffer_error;
 					}
 					else
 					{
@@ -3629,7 +3746,8 @@ void video_data_process(struct work_struct *p_work)
 				else
 				{	
 					
-					SetDeInterlace(bBuf,buf->mem,in_width,in_height,interlace);
+					if (SetDeInterlace(bBuf,buf->mem,in_width,in_height,interlace, nCopySize, vb2_plane_size(&buf->vb.vb2_buf, 0)))
+                            goto buffer_error;
 				}
 				
 			}
@@ -3637,16 +3755,26 @@ void video_data_process(struct work_struct *p_work)
 		}
 		else
 		{
-			SetNoVideoMem(buf->mem,videodev->current_out_width,videodev->curren_out_height);
+			SetNoVideoMem(buf->mem,nWidth,nHeight);
 		}
 	 	
-		buf->vb.sequence = videodev->seqnr++;
-        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);	
+		vb2_set_plane_payload(&buf->vb.vb2_buf, 0, required);
+        buf->vb.sequence = frame_sequence;
+        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+        continue;
+buffer_error:
+        pr_warn_ratelimited("HwsCapture ch%d: conversion rejected in=%dx%d out=%dx%d\n",
+                            nDecoder, in_width, in_height, nWidth, nHeight);
+        vb2_set_plane_payload(&buf->vb.vb2_buf, 0, 0);
+        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);	
 	}
 	
 		
+    goto vexit;
+bad_frame:
+    pr_warn_ratelimited("HwsCapture ch%d: drop invalid frame slot=%d\n", nDecoder, nVindex);
 vexit:
-    if (pdx->m_curr_No_Video[nDecoder] == 0 && nVindex >= 0) {
+    if (nVindex >= 0) {
         pdx->m_VideoInfo[nDecoder].pStatusInfo[nVindex].byLock = MEM_UNLOCK;
         pdx->m_nRDVideoIndex[nDecoder] = nVindex + 1;
         if (pdx->m_nRDVideoIndex[nDecoder] >= MAX_VIDEO_QUEUE)
@@ -4749,14 +4877,19 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 		int  line_cnt=0;
 		unsigned long flags;
 		
+		spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
 		nw = pdx->m_pVCAPStatus[nDecoder][0].dwWidth ;
 		nh = pdx->m_pVCAPStatus[nDecoder][0].dwHeight;
-		if((nw <0)||(nh<0)||(nw>MAX_VIDEO_HW_W)||(nh>MAX_VIDEO_HW_H))
+        interlace = pdx->m_pVCAPStatus[nDecoder][0].dwinterlace;
+        spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
+        if (nw <= 0 || nh <= 0 || (nw & 1) || nw > MAX_VIDEO_HW_W ||
+            (interlace != 0 && interlace != 1) ||
+            nh > MAX_VIDEO_HW_H / (interlace ? 2 : 1))
 		{
 			return -1;
 		}
 		mVideoBufIndex = pdx->m_nVideoBufferIndex[nDecoder]; 
-		interlace  = pdx->m_pVCAPStatus[nDecoder][0].dwinterlace;
+
 		if(pdx->m_Device_SupportYV12 ==1)
 		{
 			dwSrcPitch = nw*12/8;
@@ -4861,8 +4994,8 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 							{
 								pdx->m_VideoInfo[nDecoder].m_nVideoIndex =0;
 							}
-			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwWidth = pdx->m_pVCAPStatus[nDecoder][0].dwWidth ; 
-			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwHeight = pdx->m_pVCAPStatus[nDecoder][0].dwHeight;
+			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwWidth = nw ; 
+			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwHeight = nh;
 							pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwinterlace = interlace;
 							pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock = MEM_LOCK;
 							
@@ -5614,6 +5747,8 @@ static void ChangeVideoSize(struct hws_pcie_dev *pdx,int ch,int w,int h,int inte
 	SetVideoFormteSize(pdx,ch,w,h);
 	halfframeLength = pdx->m_format[ch].HLAF_SIZE/16;
 	WRITE_REGISTER_ULONG(pdx,(DWORD)(CBVS_IN_BUF_BASE2 + (ch*PCIE_BARADDROFSIZE)), halfframeLength); //Buffer 1 address
+    pr_info_ratelimited("HwsCapture ch%d: input %dx%d interlace=%d\n",
+                        ch, w, h, interlace);
 }
 
 static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
@@ -5738,7 +5873,8 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 			value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
 			res_w = value&0xFFFF;
 			res_h = (value>>16)&0xFFFF;
-			if(((res_w <=MAX_VIDEO_HW_W) &&(res_h<=MAX_VIDEO_HW_H)&&(interlace==0))||((res_w <=MAX_VIDEO_HW_W) &&(res_h*2<=MAX_VIDEO_HW_H)&&(interlace==1)))
+			if (res_w > 0 && res_h > 0 && !(res_w & 1) && res_w <= MAX_VIDEO_HW_W &&
+                res_h <= MAX_VIDEO_HW_H / (interlace ? 2 : 1))
 			{
 				if((res_w !=pdx->m_pVCAPStatus[ch][0].dwWidth )||(res_h!= pdx->m_pVCAPStatus[ch][0].dwHeight)||(pdx->m_pVCAPStatus[ch][0].dwinterlace!=interlace))
 				{
@@ -5763,6 +5899,8 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 {
 	//PAGED_CODE();
 	int i;
+    int no_video, old_no_video;
+    unsigned long flags;
 	//DWORD value;
 	//DWORD SetData;
 //	int ret=0;
@@ -5793,9 +5931,16 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 				
 			}
 			#endif 
-			pdx->m_curr_No_Video[i] = Get_Video_Status(pdx,i);
+            no_video = Get_Video_Status(pdx, i);
+            spin_lock_irqsave(&pdx->videoslock[i], flags);
+            old_no_video = pdx->m_curr_No_Video[i];
+            pdx->m_curr_No_Video[i] = no_video;
+            spin_unlock_irqrestore(&pdx->videoslock[i], flags);
+            if (old_no_video != no_video)
+                pr_info_ratelimited("HwsCapture ch%d: signal %s\n", i,
+                                    no_video ? "lost" : "present");
 			//---------------
-			if((pdx->m_curr_No_Video[i] ==0x1)&&(pdx->m_bVCapStarted[i]==TRUE))
+			if ((no_video == 1) && (pdx->m_bVCapStarted[i] == TRUE))
 			{
 				 //printk("[MV]check NoVideo End: [%d]\n",i);
 				 queue_work(pdx->wq,&pdx->video[i].videowork);	
@@ -5918,8 +6063,8 @@ static int probe_scan_for_msi(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 	}
 
 	printk(KERN_WARNING "HWS: MSI alloc failed rc=%d, fallback to INTx\n", rc);
-
-	rc = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_INTX);
+	
+	rc = pci_alloc_irq_vectors(pdev, 1, 1, HWS_PCI_IRQ_INTX_FLAG);
 	if (rc >= 0) {
 		lro->msi_enabled = 0;
 		lro->msix_enabled = 0;
@@ -6406,4 +6551,4 @@ module_exit(pcie_hws_exit);
 MODULE_DESCRIPTION("HWS driver");
 MODULE_AUTHOR("Alex Liu <alex.liu@longtimetech.com>");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0");
+MODULE_VERSION(HWS_FIX_VERSION);

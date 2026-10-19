@@ -30,3 +30,27 @@
 #define HWS_V4L2_FH_ADD(fh, file) v4l2_fh_add((fh))
 #define HWS_V4L2_FH_DEL(fh, file) v4l2_fh_del((fh))
 #endif
+
+
+/*
+ * PCI legacy INTx IRQ flag compatibility
+ *
+ * Some kernels use PCI_IRQ_LEGACY.
+ * Some newer kernels use PCI_IRQ_INTX.
+ * Some vendor kernels may only define one of them.
+ */
+#if defined(PCI_IRQ_INTX)
+#define HWS_PCI_IRQ_INTX_FLAG PCI_IRQ_INTX
+#elif defined(PCI_IRQ_LEGACY)
+#define HWS_PCI_IRQ_INTX_FLAG PCI_IRQ_LEGACY
+#else
+#define HWS_PCI_IRQ_INTX_FLAG 0
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,16,0)
+typedef unsigned int hws_poll_t;
+#define HWS_POLLERR POLLERR
+#else
+typedef __poll_t hws_poll_t;
+#define HWS_POLLERR EPOLLERR
+#endif
